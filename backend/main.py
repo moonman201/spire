@@ -37,6 +37,22 @@ async def lifespan(app: FastAPI):
     install_netmon()
     print("[SPIRE] Network egress monitor armed.")
 
+    # Demo-mode runtime banner — fires loudly so an operator who somehow
+    # ships a SPIRE_DEMO_MODE=1 env var into a real deployment sees it
+    # in the boot log instead of finding out via incident response. The
+    # in-process auth.py already refuses to boot without a real
+    # SPIRE_SESSION_SECRET outside demo mode; this complements it by
+    # making the demo path itself self-announcing.
+    import os as _os
+    if _os.environ.get("SPIRE_DEMO_MODE") == "1":
+        print("=" * 64)
+        print("[SPIRE] *** DEMO MODE ACTIVE ***")
+        print("[SPIRE] Open mint endpoint enabled, ephemeral signing")
+        print("[SPIRE] secret accepted, persona-spoofing dropdown live.")
+        print("[SPIRE] DO NOT run this configuration in production.")
+        print("[SPIRE] See replit.md > 'Production deployment checklist'.")
+        print("=" * 64)
+
     # Generate the canonical dataset once at boot. ~30-60 seconds.
     print("[SPIRE] Generating canonical dataset under seed 42 ...")
     ds = load_dataset()
@@ -68,8 +84,8 @@ app = FastAPI(
 # prod, but in dev we CORS them separately.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
+    allow_origin_regex=".*",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

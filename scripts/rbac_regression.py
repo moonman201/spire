@@ -17,6 +17,7 @@ for CI — no external services, no sleeps.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,14 @@ from typing import Optional
 # Allow `python scripts/rbac_regression.py` from the repo root.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# Hardening pass — the open mint endpoint is now gated behind demo mode.
+# The regression suite still exercises it, so set the flag before any
+# backend module import. Also seed a deterministic session secret so
+# tokens minted here are stable across reruns (helps when bisecting a
+# failure).
+os.environ.setdefault("SPIRE_DEMO_MODE", "1")
+os.environ.setdefault("SPIRE_SESSION_SECRET", "rbac-regression-fixed-secret-do-not-use-in-prod")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -342,8 +351,134 @@ def case_actor_role_payload_ignored_for_seed_conflict():
 # Driver
 # ---------------------------------------------------------------------------
 
+def case_mint_response_carries_structured_principal():
+    """Hardening pass — the mint endpoint must return the structured
+    Principal envelope (role + jti + attested_by + attested_at + …) so
+    the frontend / IdP adapter can correlate revocations and present
+    the operator's verified context."""
+    print("\n[case] mint returns structured Principal envelope")
+    r = client.post("/api/auth/session", json={"role": "g4"})
+    expect("mint(g4) -> 200", r.status_code == 200, f"got {r.status_code}")
+    if r.status_code != 200:
+        return
+    body = r.json()
+    expect("mint response has jti", isinstance(body.get("jti"), str) and len(body["jti"]) > 8,
+           f"jti={body.get('jti')!r}")
+    p = body.get("principal") or {}
+    expect("principal.attested_by == DEMO_MODE",
+           p.get("attested_by") == "DEMO_MODE",
+           f"attested_by={p.get('attested_by')!r}")
+    for field in ("role", "iat", "exp", "sid", "jti", "attested_at"):
+        expect(f"principal carries {field}",
+               field in p, f"missing {field}")
+
+
+def case_whoami_returns_principal():
+    """Hardening pass — `/api/auth/whoami` echoes the full Principal so
+    a UI / debug shell can show what the bearer actually carries."""
+    print("\n[case] /api/auth/whoami returns Principal envelope")
+    tok = mint("security_manager")
+    r = client.get("/api/auth/whoami", headers=auth_headers(tok))
+    expect("whoami 200", r.status_code == 200, f"got {r.status_code}")
+    if r.status_code == 200:
+        body = r.json()
+        expect("whoami.role == security_manager",
+               body.get("role") == "security_manager",
+               f"got role={body.get('role')!r}")
+        expect("whoami carries jti",
+               isinstance(body.get("jti"), str) and len(body["jti"]) > 0,
+               f"jti={body.get('jti')!r}")
+
+
+def case_revoke_requires_security_manager():
+    """Hardening pass — `/api/auth/revoke` is gated to security_manager."""
+    print("\n[case] /api/auth/revoke gated to security_manager")
+    g4 = mint("g4")
+    chief = mint("maintenance_chief")
+    r = client.post("/api/auth/revoke",
+                    headers=auth_headers(g4),
+                    json={"jti": "anything"})
+    expect("g4 -> revoke 403", r.status_code == 403, f"got {r.status_code}")
+    r = client.post("/api/auth/revoke",
+                    headers=auth_headers(chief),
+                    json={"jti": "anything"})
+    expect("maintenance_chief -> revoke 403", r.status_code == 403, f"got {r.status_code}")
+    r = client.post("/api/auth/revoke", json={"jti": "anything"})
+    expect("unauthenticated -> revoke 401", r.status_code == 401, f"got {r.status_code}")
+
+
+def case_revoke_takes_effect_immediately():
+    """Hardening pass — once a jti is revoked, the bearer must 401 on
+    the very next request. Verifies kill-switch latency is zero on the
+    local replica (peer propagation rides the air-gap queue and is
+    asserted in case_revoke_propagates_to_airgap_queue)."""
+    print("\n[case] revoked bearer is 401 on the next request")
+    sec = mint("security_manager")
+    # Mint a separate g4 token that we'll revoke.
+    r = client.post("/api/auth/session", json={"role": "g4"})
+    assert r.status_code == 200
+    g4_data = r.json()
+    g4_tok = g4_data["token"]
+    g4_jti = g4_data["jti"]
+
+    # Smoke positive: the g4 token works first.
+    r = client.get("/api/pulse/cannibalization", headers=auth_headers(g4_tok))
+    expect("g4 token works pre-revoke", r.status_code == 200, f"got {r.status_code}")
+
+    # security_manager revokes by jti.
+    r = client.post("/api/auth/revoke",
+                    headers=auth_headers(sec),
+                    json={"jti": g4_jti, "reason": "rbac-regression"})
+    expect("revoke jti -> 200 with revoked=1",
+           r.status_code == 200 and r.json().get("revoked") == 1,
+           f"got {r.status_code} body={r.text[:120]}")
+
+    # The revoked g4 token must now 401 — including with TokenRevoked.
+    r = client.get("/api/pulse/cannibalization", headers=auth_headers(g4_tok))
+    expect("revoked bearer -> 401",
+           r.status_code == 401 and "TokenRevoked" in r.text,
+           f"got {r.status_code} body={r.text[:160]}")
+
+
+def case_revoke_propagates_to_airgap_queue():
+    """Hardening pass — every revocation event lands on the air-gap
+    queue (live or air-gapped) so the kill-switch reaches peer replicas
+    on next sync."""
+    print("\n[case] revoke propagates to air-gap sync queue")
+    sec = mint("security_manager")
+    r = client.post("/api/auth/session", json={"role": "data_custodian"})
+    assert r.status_code == 200
+    target_jti = r.json()["jti"]
+    client.post("/api/auth/revoke",
+                headers=auth_headers(sec),
+                json={"jti": target_jti, "reason": "queue-propagation-test"})
+    r = client.get("/api/system/comms/queue?limit=200", headers=auth_headers(sec))
+    expect("queue inspect 200 (security_manager)",
+           r.status_code == 200, f"got {r.status_code}")
+    ops = r.json().get("queue", [])
+    match = next((o for o in ops if o.get("op_kind") == "session.revoke"
+                  and (o.get("payload") or {}).get("jti") == target_jti), None)
+    expect("session.revoke op queued for target jti",
+           match is not None,
+           f"queue depth={len(ops)} match={match}")
+
+    # comms/queue gating — must reject unauth and non-airgap roles.
+    print("\n[case] comms/queue is gated to AIRGAP_ROLES")
+    r = client.get("/api/system/comms/queue")
+    expect("comms/queue GET unauth -> 401",
+           r.status_code == 401, f"got {r.status_code}")
+    g4 = mint("g4")
+    r = client.get("/api/system/comms/queue", headers=auth_headers(g4))
+    expect("comms/queue GET as g4 -> 403",
+           r.status_code == 403, f"got {r.status_code}")
+    r = client.post("/api/system/comms/queue", headers=auth_headers(g4),
+                    json={"op_kind": "test", "payload": {}, "actor": "g4"})
+    expect("comms/queue POST as g4 -> 403",
+           r.status_code == 403, f"got {r.status_code}")
+
+
 def main() -> int:
-    print("SPIRE RBAC regression — replays issues #3-#10")
+    print("SPIRE RBAC regression — replays issues #3-#10 + hardening cases")
     case_unauthenticated_blocked()
     case_wrong_role_forbidden()
     case_authorized_role_allowed()
@@ -353,6 +488,12 @@ def main() -> int:
     case_cannibalization_or_vs_and_fix()
     case_forecast_unit_scope_enforced()
     case_actor_role_payload_ignored_for_seed_conflict()
+    # Hardening pass additions:
+    case_mint_response_carries_structured_principal()
+    case_whoami_returns_principal()
+    case_revoke_requires_security_manager()
+    case_revoke_takes_effect_immediately()
+    case_revoke_propagates_to_airgap_queue()
 
     print("\n----------------------------------------")
     print(f"  PASSED: {len(PASSED)}")

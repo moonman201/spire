@@ -20,11 +20,24 @@ let _tokenRole: string | null = null;
 export function getSessionToken(): string | null { return _token; }
 export function getSessionRole(): string | null { return _tokenRole; }
 
-export async function mintSession(role: string): Promise<{ token: string; role: string; expires_at: number }> {
-  // Note: this mint endpoint is itself unauthenticated by design — it's
-  // the persona-switch entry. A CAC/Keycloak deployment would require an
-  // upstream identity assertion in the body and reject mints whose role
-  // claim isn't backed by the assertion's verified groups.
+/**
+ * Returns the Authorization header dict for the current session bearer.
+ * Use this at any direct `fetch` call site that talks to `/api/...` —
+ * the backend's `current_role` dependency will 401 without it. Returns
+ * an empty object when there's no session yet so callers don't have to
+ * special-case the boot path.
+ */
+export function authHeaders(): Record<string, string> {
+  return _token ? { Authorization: `Bearer ${_token}` } : {};
+}
+
+export async function mintSession(role: string): Promise<{ token: string; role: string; expires_at: number; jti?: string }> {
+  // Note: this mint endpoint is open ONLY when the backend was started
+  // with SPIRE_DEMO_MODE=1. Outside demo mode the backend returns 503
+  // with `{error: "DemoModeRequired"}` and the persona dropdown will
+  // surface that — production deployments must front-end this with the
+  // CAC/Keycloak adapter that derives role+unit+billet from a verified
+  // upstream assertion.
   const resp = await fetch(`${BASE}/auth/session`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -32,6 +45,12 @@ export async function mintSession(role: string): Promise<{ token: string; role: 
   });
   if (!resp.ok) {
     const body = await resp.text();
+    if (resp.status === 503 && body.includes("DemoModeRequired")) {
+      throw new Error(
+        "Backend is not in demo mode — open mint endpoint disabled. " +
+        "Set SPIRE_DEMO_MODE=1 on the backend or attach a CAC/Keycloak adapter."
+      );
+    }
     throw new Error(`mintSession ${resp.status}: ${body.slice(0, 200)}`);
   }
   const data = await resp.json();

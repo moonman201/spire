@@ -14,7 +14,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from typing import Optional
 
 from ..state import get_dataset
-from ..auth import current_role, current_role_optional
+from ..auth import current_role, current_role_optional, register_revocation_sink
 from ..persistence import (
     feedback_summary,
     log as audit_log,
@@ -48,6 +48,38 @@ _AIR_GAPPED: bool = False
 _QUEUE: list[dict] = []
 
 router = APIRouter()
+
+
+# Hardening pass — kill-switch propagation through the air-gap queue.
+# auth.py owns revocation but doesn't know about the queue; we register a
+# sink here so every revocation event (regardless of comms state) lands on
+# the queue with replayed_at=None when air-gapped, and as an
+# already-replayed marker when live. Either way, the next sync flush mirrors
+# the revocation to the (notional) master replicas — the persona memo
+# called this out as a non-trivial integration with the existing sync
+# seam, and this is the seam.
+def _enqueue_revocation(event: dict) -> None:
+    op = {
+        "local_id": f"REVOKE-{uuid.uuid4().hex[:10]}",
+        "op_kind": "session.revoke",
+        "payload": {
+            "jti": event.get("jti"),
+            "session_id": event.get("session_id"),
+            "reason": event.get("reason"),
+        },
+        "actor": event.get("actor", "security_manager"),
+        "actor_edipi": None,
+        "queued_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        # When live, the local table is already authoritative; we still
+        # log the op as already-replayed so an inspector can see the
+        # propagation trail without it counting toward queue depth.
+        "replayed_at": None if _AIR_GAPPED else datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "replay_result": None if _AIR_GAPPED else "applied-locally",
+    }
+    _QUEUE.append(op)
+
+
+register_revocation_sink(_enqueue_revocation)
 
 
 async def _probe_llm_brief() -> dict:
@@ -417,19 +449,28 @@ async def comms_airgap(payload: dict = Body(default={}),
 
 
 @router.post("/comms/queue")
-async def comms_queue(payload: dict = Body(default={})):
-    """Queue a mutation while air-gapped. Body: {op_kind, payload, actor,
-    actor_edipi?}. Returns the local_id assigned. While the air-gap toggle
-    is OFF, the queue is bypassed and the caller should hit the live
-    endpoint directly — we surface this as a 409 so the frontend can fall
-    through to the canonical write path."""
+async def comms_queue(payload: dict = Body(default={}),
+                      role: str = Depends(current_role)):
+    """Queue a mutation while air-gapped. Body: {op_kind, payload,
+    actor_edipi?}. The actor is taken from the bearer-resolved role, NOT
+    from the request body — earlier the body's `actor` field was trusted
+    and could mis-attribute queued ops in the audit chain. Returns the
+    local_id assigned. While the air-gap toggle is OFF, the queue is
+    bypassed and the caller should hit the live endpoint directly — we
+    surface this as a 409 so the frontend can fall through to the
+    canonical write path."""
+    require_role(role, AIRGAP_ROLES, "comms.queue.write")
     if not _AIR_GAPPED:
         raise HTTPException(status_code=409, detail="not air-gapped — call the live endpoint directly")
     op = {
         "local_id": f"AGQ-{uuid.uuid4().hex[:10]}",
         "op_kind": payload.get("op_kind", "unknown"),
         "payload": payload.get("payload", {}),
-        "actor": payload.get("actor", "operator"),
+        # Bearer-resolved actor wins over any body-supplied claim. The
+        # write goes into the air-gap sync queue and eventually the
+        # audit chain on the peer; we don't want the queue to be the
+        # back door that re-introduces spoofable actor strings.
+        "actor": role,
         "actor_edipi": payload.get("actor_edipi"),
         "queued_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "replayed_at": None,
@@ -440,8 +481,14 @@ async def comms_queue(payload: dict = Body(default={})):
 
 
 @router.get("/comms/queue")
-async def comms_queue_list(limit: int = 50):
-    """Inspect the queue (read-only)."""
+async def comms_queue_list(limit: int = 50,
+                           role: str = Depends(current_role)):
+    """Inspect the queue (read-only). Same allowlist as the write
+    endpoint — the queue can carry session.revoke ops, classification
+    payloads, and other operationally sensitive items. Originally open;
+    second-review feedback flagged it as the obvious next gating
+    target."""
+    require_role(role, AIRGAP_ROLES, "comms.queue.read")
     return {
         "queue": _QUEUE[-limit:],
         "depth": len([q for q in _QUEUE if not q.get("replayed_at")]),
@@ -457,13 +504,19 @@ _FEEDBACK_LOG: list[dict] = []
 
 
 @router.post("/feedback")
-async def submit_feedback(payload: dict = Body(default={})):
+async def submit_feedback(payload: dict = Body(default={}),
+                          bearer_role: Optional[str] = Depends(current_role_optional)):
     """Pilot operator feedback submitted from the in-app drawer.
 
     Always lands locally to the audit chain so we don't lose anything in
     air-gap conditions. When `SPIRE_GITHUB_TOKEN` is set, also creates a
     GitHub issue against the configured repo so the maintainer + cohort
-    can triage from the same surface they file PRs."""
+    can triage from the same surface they file PRs.
+
+    Auth: deliberately permissive — feedback may be submitted without a
+    bearer (drawer is reachable from the unauth landing). If a bearer is
+    present, its resolved role wins over any body-supplied `role`/`actor`
+    so the audit attribution can't be spoofed by the client."""
     title = (payload.get("title") or "").strip()
     body = (payload.get("body") or "").strip()
     if not title or not body:
@@ -473,9 +526,11 @@ async def submit_feedback(payload: dict = Body(default={})):
     if issue_type not in ("bug", "idea", "question", "praise"):
         issue_type = "bug"
     severity = payload.get("severity", "minor")
-    role = payload.get("role", "unknown")
+    # Bearer-resolved role/actor wins. Body-supplied values are kept only
+    # as the fallback when the request is unauthenticated.
+    role = bearer_role or payload.get("role", "unknown")
     view = payload.get("view", "")
-    actor = payload.get("actor", role)
+    actor = bearer_role or payload.get("actor") or role
     # Optional self-identified submitter — kept distinct from `actor` (role).
     # Sanitized to strip newlines and clamp length so it can't break the
     # GitHub issue title or smuggle markdown into the body.

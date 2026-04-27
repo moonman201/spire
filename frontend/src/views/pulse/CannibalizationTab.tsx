@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api, type Cannibalization } from "../../api";
+import { api, authHeaders, type Cannibalization } from "../../api";
 import { LoadingOverlay } from "./FleetOverviewTab";
 import { useSpireStore } from "../../state/store";
 
@@ -133,10 +133,11 @@ export function CannibalizationTab() {
       // never blocks on the network.
       const ctrl = new AbortController();
       const timer = window.setTimeout(() => ctrl.abort(), 15_000);
+      let authBlocked = false;
       try {
-        await fetch("/api/pulse/cannibalization/propose", {
+        const r = await fetch("/api/pulse/cannibalization/propose", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify({
             recipient_sr: confirmDonor.need.sr_number,
             donor_sr: confirmDonor.donor.sr_number,
@@ -144,6 +145,12 @@ export function CannibalizationTab() {
           }),
           signal: ctrl.signal,
         });
+        // Auth/forbidden is NOT a network blip — the operator's bearer
+        // can't propose this op (wrong role / expired session). Surface
+        // it instead of pretending the optimistic row succeeded.
+        if (r.status === 401 || r.status === 403) {
+          authBlocked = true;
+        }
       } catch {
         /* Backend may not implement this endpoint yet OR cold-start
          * timeout — keep the optimistic row visible so the operator's
@@ -151,10 +158,17 @@ export function CannibalizationTab() {
       } finally {
         window.clearTimeout(timer);
       }
-      pushToast({
-        tone: "ok",
-        text: `Match proposed · ${confirmDonor.need.asset_id} ← ${confirmDonor.donor.asset_id}`,
-      });
+      if (authBlocked) {
+        pushToast({
+          tone: "warn",
+          text: "Not authorized to propose cannibalizations. Switch to a Maintenance role.",
+        });
+      } else {
+        pushToast({
+          tone: "ok",
+          text: `Match proposed · ${confirmDonor.need.asset_id} ← ${confirmDonor.donor.asset_id}`,
+        });
+      }
       setConfirmDonor(null);
       setSelectedNeed(null);
     } finally {

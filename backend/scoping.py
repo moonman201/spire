@@ -33,6 +33,9 @@ AIRGAP_ROLES             = frozenset({"security_manager", "mef_commander"})
 COALITION_RELEASE_ROLES  = frozenset({"data_custodian", "security_manager"})
 ADMIN_TELEMETRY_ROLES    = frozenset({"security_manager"})
 AUDIT_READ_ROLES         = frozenset({"security_manager"})
+# Token revocation kill-switch — security manager only. Hardening pass:
+# revoked sessions propagate through the existing air-gap queue.
+REVOKE_ROLES             = frozenset({"security_manager"})
 
 # Module-wide view scope. Mirrors frontend `VIEW_SCOPE` in store.ts so an
 # operator who URL-hops into a module they shouldn't see gets a 403 from

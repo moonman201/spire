@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import clsx from "clsx";
-import { api, type SentryBatch } from "../../api";
+import { api, authHeaders, type SentryBatch } from "../../api";
 import { formatApiError } from "../../api-retry";
 import type { SentryContext } from "../SentryView";
 
@@ -56,7 +56,14 @@ export function UploadTab({ ctx }: { ctx: SentryContext }) {
     try {
       const form = new FormData();
       form.append("file", file);
-      const resp = await fetch("/api/sentry/upload", { method: "POST", body: form });
+      // Multipart upload — let the browser set the Content-Type boundary,
+      // we only attach the bearer header. The backend's current_role
+      // dependency 401s without it.
+      const resp = await fetch("/api/sentry/upload", {
+        method: "POST",
+        headers: authHeaders(),
+        body: form,
+      });
       if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
       const b = await resp.json();
       setBatch(b);

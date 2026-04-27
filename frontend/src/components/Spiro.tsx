@@ -20,6 +20,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useSpireStore } from "../state/store";
+import { authHeaders } from "../api";
 
 interface PlanStep { tool: string; args: Record<string, any>; id?: string; }
 interface SpiroPlan {
@@ -111,7 +112,7 @@ export function Spiro() {
     try {
       const r = await fetch("/api/copilot/plan", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ text: t, role, view: location.pathname }),
       });
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -147,7 +148,7 @@ export function Spiro() {
     try {
       const r = await fetch("/api/copilot/execute", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ plan_id: plan.plan_id, steps: plan.steps, role }),
       });
       if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);

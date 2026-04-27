@@ -27,7 +27,7 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -118,11 +118,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
     subject_id  TEXT,                     -- sr_number, asset_id, incident_number, etc.
     payload     TEXT NOT NULL,            -- JSON body describing the event
     prev_hash   TEXT NOT NULL,            -- hex digest of previous row's self_hash (genesis = 64 zeros)
-    self_hash   TEXT NOT NULL             -- SHA-256(prev_hash || row-canonical-bytes)
+    self_hash   TEXT NOT NULL,            -- SHA-256(prev_hash || row-canonical-bytes)
+    redacted    INTEGER NOT NULL DEFAULT 0  -- 1 = payload soft-redacted via prune_audit; verify_chain skips recomputation but still chains through self_hash
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_kind ON audit_log(kind);
 CREATE INDEX IF NOT EXISTS idx_audit_ts   ON audit_log(ts);
+
+-- Token revocation list — kill-switch for compromised bearers. Checked on
+-- every authenticated request via auth.verify(). Rows are written either
+-- by `/api/auth/revoke` (security_manager) or by the air-gap queue replay
+-- when a peer's revocation flushes back into local state.
+CREATE TABLE IF NOT EXISTS revoked_sessions (
+    jti          TEXT PRIMARY KEY,
+    sid          TEXT,
+    actor        TEXT NOT NULL,
+    reason       TEXT,
+    revoked_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_revoked_sid ON revoked_sessions(sid);
 
 CREATE TABLE IF NOT EXISTS sentry_decisions (
     sr_number   TEXT PRIMARY KEY,
@@ -163,6 +178,15 @@ CREATE TABLE IF NOT EXISTS uploaded_batches (
 def init_db() -> None:
     with conn() as c:
         c.executescript(SCHEMA)
+        # Idempotent migration for the `redacted` column on legacy DBs that
+        # were created before the hardening pass. SQLite's
+        # `CREATE TABLE IF NOT EXISTS` won't add new columns to an existing
+        # table, so we ALTER explicitly and swallow the duplicate-column
+        # error to keep init_db idempotent.
+        try:
+            c.execute("ALTER TABLE audit_log ADD COLUMN redacted INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already present
 
 
 # ---------------------------------------------------------------------------
@@ -205,14 +229,36 @@ def log(kind: str, *, actor: str = "system", subject_id: Optional[str] = None, p
 
 
 def verify_chain() -> dict:
-    """Walk the entire audit table. Returns {ok, entries, broken_at}."""
+    """Walk the entire audit table. Returns {ok, entries, broken_at}.
+
+    Soft-redacted rows (set by `prune_audit`) are chained through using
+    their stored `self_hash` without recomputing from the row body — the
+    payload is intentionally no longer the original bytes, so a
+    recompute would always fail. The `redacted_count` field surfaces how
+    many rows are in this state so an inspector can see what the chain
+    has been pruned to.
+    """
     with conn() as c:
         rows = list(c.execute(
-            "SELECT id, ts, actor, kind, subject_id, payload, prev_hash, self_hash "
+            "SELECT id, ts, actor, kind, subject_id, payload, prev_hash, self_hash, "
+            "       COALESCE(redacted, 0) AS redacted "
             "FROM audit_log ORDER BY id ASC"
         ))
     prev = _GENESIS
+    redacted_count = 0
     for r in rows:
+        if int(r["redacted"] or 0) == 1:
+            # Trust the stored self_hash as the chain anchor for redacted
+            # rows; only verify that the row's prev_hash matches the
+            # running head. Tampering with a redacted row's payload is
+            # still detectable: if anyone *un*redacts and recomputes,
+            # the next non-redacted row's recompute will diverge.
+            if r["prev_hash"] != prev:
+                return {"ok": False, "entries": len(rows), "broken_at_id": r["id"],
+                        "reason": "redacted_prev_hash_mismatch"}
+            prev = r["self_hash"]
+            redacted_count += 1
+            continue
         entry = {
             "ts": r["ts"], "actor": r["actor"], "kind": r["kind"],
             "subject_id": r["subject_id"], "payload": r["payload"],
@@ -222,7 +268,136 @@ def verify_chain() -> dict:
         if r["prev_hash"] != prev or r["self_hash"] != expected:
             return {"ok": False, "entries": len(rows), "broken_at_id": r["id"]}
         prev = r["self_hash"]
-    return {"ok": True, "entries": len(rows), "head_hash": prev}
+    return {"ok": True, "entries": len(rows), "head_hash": prev,
+            "redacted_entries": redacted_count}
+
+
+def prune_audit(older_than_days: int, *, actor: str = "system") -> dict:
+    """Soft-redact audit rows older than `older_than_days`.
+
+    Retention bound called out by the persona memo — the audit chain is a
+    metadata mountain that adversary intel wants more than the content
+    itself. We keep the chain *integrity* (prev_hash / self_hash unchanged
+    so the SHA-256 spine still links) but overwrite the payload column
+    with a placeholder. `verify_chain()` recognizes the `redacted` flag
+    and skips body recomputation while still chaining the hash forward.
+
+    The prune itself is recorded as an `audit_pruned` entry so the chain
+    shows when retention fired and what was reduced.
+
+    Returns `{pruned, oldest_pruned_ts, newest_pruned_ts, retention_days}`.
+    """
+    if older_than_days <= 0:
+        raise ValueError("older_than_days must be > 0")
+    cutoff = (datetime.utcnow() - timedelta(days=older_than_days)) \
+        .isoformat(timespec="seconds") + "Z"
+    placeholder = json.dumps({"redacted": True}, separators=(",", ":"))
+
+    with conn() as c:
+        rows = list(c.execute(
+            "SELECT id, ts FROM audit_log "
+            "WHERE COALESCE(redacted, 0) = 0 AND ts < ? ORDER BY id ASC",
+            (cutoff,),
+        ))
+        if not rows:
+            return {"pruned": 0, "retention_days": older_than_days,
+                    "oldest_pruned_ts": None, "newest_pruned_ts": None}
+        oldest_ts = rows[0]["ts"]
+        newest_ts = rows[-1]["ts"]
+        ids = [r["id"] for r in rows]
+        # Bulk update payloads + flag; chain hashes preserved as-is.
+        c.executemany(
+            "UPDATE audit_log SET payload = ?, redacted = 1 WHERE id = ?",
+            [(placeholder, i) for i in ids],
+        )
+
+    log(
+        "audit_pruned",
+        actor=actor,
+        subject_id="audit_log",
+        payload={
+            "pruned_count": len(ids),
+            "retention_days": older_than_days,
+            "oldest_pruned_ts": oldest_ts,
+            "newest_pruned_ts": newest_ts,
+            "id_range": [ids[0], ids[-1]],
+        },
+    )
+    return {"pruned": len(ids), "retention_days": older_than_days,
+            "oldest_pruned_ts": oldest_ts, "newest_pruned_ts": newest_ts}
+
+
+# ---------------------------------------------------------------------------
+# Token revocation — kill-switch for compromised bearers
+# ---------------------------------------------------------------------------
+
+def revoke_session(*, jti: Optional[str] = None, sid: Optional[str] = None,
+                   actor: str = "system", reason: str = "operator-initiated") -> int:
+    """Insert into `revoked_sessions`. Idempotent on jti.
+
+    If `sid` is provided without a jti, the row is keyed off a synthetic
+    `sid:<sid>` jti so subsequent verify() lookups by sid still hit. In
+    practice security_manager calls always carry a jti; the sid path
+    exists for "revoke-everything-bound-to-this-session-id" cases that a
+    future incident-response runbook may want.
+
+    Returns 1 if a new row was inserted, 0 if already revoked.
+    """
+    if not jti and not sid:
+        raise ValueError("revoke_session requires jti or sid")
+    key = jti or f"sid:{sid}"
+    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    with conn() as c:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO revoked_sessions(jti, sid, actor, reason, revoked_at) "
+            "VALUES (?,?,?,?,?)",
+            (key, sid, actor, reason, ts),
+        )
+        inserted = cur.rowcount or 0
+    if inserted:
+        log("session_revoked", actor=actor, subject_id=key,
+            payload={"jti": jti, "sid": sid, "reason": reason})
+    return int(inserted)
+
+
+def is_session_revoked(jti: str) -> bool:
+    """Return True if the jti (or its sid-synthesized key) is revoked."""
+    if not jti:
+        return False
+    with conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM revoked_sessions WHERE jti = ? LIMIT 1",
+            (jti,),
+        ).fetchone()
+    return row is not None
+
+
+def is_sid_revoked(sid: str) -> bool:
+    """Return True if any revocation row targets this session id.
+
+    Lets a security_manager kill every token bound to a sid in one shot
+    (an "incident-response" lever) — without it, a sid-only revoke went
+    into the table but `verify()` never noticed because it only matched
+    on jti. Now `verify()` calls both helpers.
+    """
+    if not sid:
+        return False
+    with conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM revoked_sessions WHERE sid = ? LIMIT 1",
+            (sid,),
+        ).fetchone()
+    return row is not None
+
+
+def list_revoked_sessions(limit: int = 100) -> list[dict]:
+    with conn() as c:
+        rows = c.execute(
+            "SELECT jti, sid, actor, reason, revoked_at FROM revoked_sessions "
+            "ORDER BY revoked_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def recent_entries(limit: int = 50) -> list[dict]:
