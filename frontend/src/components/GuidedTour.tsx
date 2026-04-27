@@ -15,6 +15,16 @@
  * skipped. The tour now covers the operator's full workspace, not just
  * the global header.
  *
+ * Polish pass v3: steps are grouped into named sections (Workspace,
+ * BASTION, PULSE, SENTRY, ADMIN, Help) so the operator always sees
+ * "PULSE · Risk Board · Section 3 of 6" instead of an opaque step
+ * count. Card content cross-fades between steps so navigation between
+ * pages doesn't feel jarring. Spotlight has a subtle breathing pulse
+ * so the eye knows where to land. A "Loading next page…" hint shows
+ * during route transitions so the gap between click and spotlight
+ * feels intentional. Closes with a "Tour complete" celebration card
+ * instead of just disappearing.
+ *
  * Triggers (any of):
  *   - First-run, after Onboarding modal dismissed (auto, gated by
  *     localStorage `spire.tour.v1.seen`)
@@ -25,7 +35,7 @@
  * Persistence: localStorage `spire.tour.v1.seen`. Cleared by the "Replay
  * tour" button in HelpOverlay so operators can re-run it any time.
  */
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useSpireStore, VIEW_SCOPE, type Role } from "../state/store";
@@ -38,13 +48,18 @@ export const TOUR_START_EVENT = "spire:start-tour";
 const SPOTLIGHT_PAD = 8;
 // Extra room reserved for the tooltip card when computing placement.
 const CARD_GAP = 16;
-const CARD_WIDTH = 360;
-const CARD_HEIGHT_ESTIMATE = 240;
+const CARD_WIDTH = 380;
+const CARD_HEIGHT_ESTIMATE = 280;
 // How long to poll for a target element after navigating to a route
 // before giving up and either skipping the step or rendering the card
 // without a spotlight.
 const TARGET_POLL_MS = 100;
 const TARGET_POLL_MAX_MS = 2500;
+// Card cross-fade duration — long enough to feel intentional, short
+// enough not to slow the user down.
+const FADE_MS = 220;
+
+type SectionKey = "workspace" | "bastion" | "pulse" | "sentry" | "admin" | "help";
 
 interface TourStep {
   id: string;
@@ -52,6 +67,9 @@ interface TourStep {
   target: string;
   title: string;
   body: string;
+  // Section label — drives the "Section X of Y · LABEL" header in the
+  // card and the grouping of progress pips.
+  section: SectionKey;
   // If present, only show this step when the current role is in the list.
   // Steps absent from the DOM at runtime are skipped automatically too.
   roles?: Role[];
@@ -62,10 +80,20 @@ interface TourStep {
   route?: string;
 }
 
+const SECTION_LABELS: Record<SectionKey, string> = {
+  workspace: "Workspace",
+  bastion: "BASTION",
+  pulse: "PULSE",
+  sentry: "SENTRY",
+  admin: "ADMIN",
+  help: "Help & feedback",
+};
+
 const STEPS: TourStep[] = [
   // ── Section 1 — global chrome (visible from any route) ────────────
   {
     id: "classification",
+    section: "workspace",
     target: "classification",
     title: "Classification banner",
     body:
@@ -73,6 +101,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "brand",
+    section: "workspace",
     target: "brand",
     title: "Welcome to SPIRE",
     body:
@@ -80,6 +109,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "nav-tabs",
+    section: "workspace",
     target: "nav-tabs",
     title: "The three workspaces",
     body:
@@ -87,6 +117,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "role-selector",
+    section: "workspace",
     target: "role-selector",
     title: "Switch your role",
     body:
@@ -94,6 +125,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "alert-badge",
+    section: "workspace",
     target: "alert-badge",
     title: "What needs your attention",
     body:
@@ -101,6 +133,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "airgap",
+    section: "workspace",
     target: "airgap",
     title: "Air-gap mode (offline operations)",
     body:
@@ -111,6 +144,7 @@ const STEPS: TourStep[] = [
   // ── Section 2 — BASTION (live map) ────────────────────────────────
   {
     id: "bastion-overview",
+    section: "bastion",
     target: "bastion-content",
     title: "BASTION · the live map",
     body:
@@ -121,6 +155,7 @@ const STEPS: TourStep[] = [
   // ── Section 3 — PULSE (readiness) ─────────────────────────────────
   {
     id: "pulse-overview",
+    section: "pulse",
     target: "pulse-overview-content",
     title: "PULSE · Overview",
     body:
@@ -129,6 +164,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "pulse-risk",
+    section: "pulse",
     target: "pulse-risk-content",
     title: "PULSE · Risk Board",
     body:
@@ -137,6 +173,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "pulse-cannib",
+    section: "pulse",
     target: "pulse-cannib-content",
     title: "PULSE · Cannibalization",
     body:
@@ -145,6 +182,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "pulse-forecast",
+    section: "pulse",
     target: "pulse-forecast-content",
     title: "PULSE · Forecast",
     body:
@@ -155,6 +193,7 @@ const STEPS: TourStep[] = [
   // ── Section 4 — SENTRY (data pipeline) ────────────────────────────
   {
     id: "sentry-upload",
+    section: "sentry",
     target: "sentry-upload-content",
     title: "SENTRY · Upload",
     body:
@@ -163,6 +202,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "sentry-review",
+    section: "sentry",
     target: "sentry-review-content",
     title: "SENTRY · Review Queue",
     body:
@@ -171,6 +211,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "sentry-coalition",
+    section: "sentry",
     target: "sentry-coalition-content",
     title: "SENTRY · Coalition Preview",
     body:
@@ -179,6 +220,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "sentry-export",
+    section: "sentry",
     target: "sentry-export-content",
     title: "SENTRY · Export / Release",
     body:
@@ -189,6 +231,7 @@ const STEPS: TourStep[] = [
   // ── Section 5 — ADMIN (security manager only) ─────────────────────
   {
     id: "admin",
+    section: "admin",
     target: "admin-content",
     title: "ADMIN · Audit + Telemetry",
     body:
@@ -200,6 +243,7 @@ const STEPS: TourStep[] = [
   // ── Section 6 — closing utilities ─────────────────────────────────
   {
     id: "help",
+    section: "help",
     target: "help-button",
     title: "Quick help, anytime",
     body:
@@ -207,6 +251,7 @@ const STEPS: TourStep[] = [
   },
   {
     id: "feedback",
+    section: "help",
     target: "feedback-button",
     title: "Tell us what's broken",
     body:
@@ -249,16 +294,44 @@ export function GuidedTour() {
   const location = useLocation();
   const [active, setActive] = useState(false);
   const [stepIdx, setStepIdx] = useState(0);
+  // Separate "completed" state — when the user clicks past the last
+  // step we show a celebration card before fully dismissing. Keeps the
+  // tour from feeling like it just disappears.
+  const [completed, setCompleted] = useState(false);
   const [rect, setRect] = useState<Rect | null>(null);
-  const cardRef = useRef<HTMLDivElement | null>(null);
+  // Cross-fade: when stepIdx changes we briefly hide the card content
+  // (and the spotlight) so the new placement doesn't snap into view.
+  const [transitioning, setTransitioning] = useState(false);
+  // Tracks whether we're between navigating to a new route and the
+  // target appearing. Drives the "Loading next page…" hint.
+  const [waitingForTarget, setWaitingForTarget] = useState(false);
 
   // Steps applicable to the current role + route scope. Recomputed every
   // time `active` or `role` changes.
-  const visibleSteps = STEPS.filter((s) => {
-    if (s.roles && !s.roles.includes(role)) return false;
-    if (!routeAllowedForRole(s.route, role)) return false;
-    return true;
-  });
+  const visibleSteps = useMemo(
+    () =>
+      STEPS.filter((s) => {
+        if (s.roles && !s.roles.includes(role)) return false;
+        if (!routeAllowedForRole(s.route, role)) return false;
+        return true;
+      }),
+    [role],
+  );
+
+  // Per-section breakdown for the header label and grouped pips.
+  const sectionBreakdown = useMemo(() => {
+    const order: SectionKey[] = ["workspace", "bastion", "pulse", "sentry", "admin", "help"];
+    const groups = order
+      .map((key) => ({
+        key,
+        label: SECTION_LABELS[key],
+        steps: visibleSteps.filter((s) => s.section === key),
+      }))
+      .filter((g) => g.steps.length > 0);
+    return groups;
+  }, [visibleSteps]);
+
+  const totalSections = sectionBreakdown.length;
 
   // First-run autostart — see comment block below for the two triggers.
   useEffect(() => {
@@ -298,6 +371,7 @@ export function GuidedTour() {
   useEffect(() => {
     function onStart() {
       setStepIdx(0);
+      setCompleted(false);
       setActive(true);
     }
     window.addEventListener(TOUR_START_EVENT, onStart);
@@ -311,27 +385,28 @@ export function GuidedTour() {
   // measuring. Done in a separate effect so navigate() doesn't fire
   // on every re-render of the same step.
   useEffect(() => {
-    if (!active || !currentStep) return;
+    if (!active || completed || !currentStep) return;
     if (!currentStep.route) return;
-    // Only navigate if we're not already there. HashRouter location
-    // pathname is the path *after* the hash, so /pulse/risk compares
-    // directly to currentStep.route.
     if (location.pathname !== currentStep.route) {
       navigate(currentStep.route);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, stepIdx]);
+  }, [active, stepIdx, completed]);
 
   // Recompute spotlight rect on step change, viewport resize, and scroll.
   // Polls for the target up to TARGET_POLL_MAX_MS — needed because a
   // step that just navigated has to wait for the new view's lazy chunk
   // to load and render before its data-tour-id appears in the DOM.
   useLayoutEffect(() => {
-    if (!active || !currentStep) return;
+    if (!active || completed || !currentStep) return;
     let cancelled = false;
     let attempts = 0;
     const maxAttempts = Math.ceil(TARGET_POLL_MAX_MS / TARGET_POLL_MS);
     let pollHandle: number | undefined;
+
+    // Mark as waiting until target measured. Cleared in tryMeasure on
+    // success or on max-attempts fallback.
+    setWaitingForTarget(true);
 
     function tryMeasure() {
       if (cancelled) return;
@@ -346,6 +421,7 @@ export function GuidedTour() {
           try { el.scrollIntoView({ block: "center", inline: "center", behavior: "auto" }); } catch { /* noop */ }
         }
         setRect(rectOf(el));
+        setWaitingForTarget(false);
         return;
       }
       attempts += 1;
@@ -353,6 +429,7 @@ export function GuidedTour() {
         // Fallback: render the card without a spotlight (full-screen
         // dim). Better than blocking the tour entirely.
         setRect(null);
+        setWaitingForTarget(false);
         return;
       }
       pollHandle = window.setTimeout(tryMeasure, TARGET_POLL_MS);
@@ -373,25 +450,58 @@ export function GuidedTour() {
       window.removeEventListener("resize", onResize);
       window.removeEventListener("scroll", onResize, true);
     };
-  }, [active, currentStep, stepIdx, location.pathname]);
+  }, [active, completed, currentStep, stepIdx, location.pathname]);
 
   const finish = useCallback(() => {
     setActive(false);
     setStepIdx(0);
+    setCompleted(false);
     try { localStorage.setItem(SEEN_KEY, "1"); } catch { /* tolerant */ }
   }, []);
 
+  const advance = useCallback(
+    (delta: 1 | -1) => {
+      // Cross-fade out, then update the index, then fade back in via
+      // the rect/measurement flow. Spotlight is hidden during the fade
+      // so the operator sees a clean transition rather than a snap.
+      setTransitioning(true);
+      window.setTimeout(() => {
+        setStepIdx((i) => Math.max(0, Math.min(visibleSteps.length - 1, i + delta)));
+        // Fade back in — handled by the next effect via setTransitioning(false)
+        // after the new rect lands. We give it one frame here as a floor.
+        window.setTimeout(() => setTransitioning(false), 30);
+      }, FADE_MS);
+    },
+    [visibleSteps.length],
+  );
+
   const next = useCallback(() => {
     if (stepIdx >= visibleSteps.length - 1) {
-      finish();
+      // Final step → celebration card. Operator clicks "Got it" once
+      // more (or any key) to actually dismiss.
+      setTransitioning(true);
+      window.setTimeout(() => {
+        setCompleted(true);
+        window.setTimeout(() => setTransitioning(false), 30);
+      }, FADE_MS);
       return;
     }
-    setStepIdx((i) => i + 1);
-  }, [stepIdx, visibleSteps.length, finish]);
+    advance(1);
+  }, [stepIdx, visibleSteps.length, advance]);
 
   const prev = useCallback(() => {
-    setStepIdx((i) => Math.max(0, i - 1));
-  }, []);
+    if (completed) {
+      // From celebration card, "Back" returns to the last step.
+      setTransitioning(true);
+      window.setTimeout(() => {
+        setCompleted(false);
+        window.setTimeout(() => setTransitioning(false), 30);
+      }, FADE_MS);
+      return;
+    }
+    if (stepIdx === 0) return;
+    advance(-1);
+  }, [stepIdx, advance, completed]);
 
   // ESC to dismiss, ←/→ to navigate.
   useEffect(() => {
@@ -412,7 +522,7 @@ export function GuidedTour() {
     return () => window.removeEventListener("keydown", onKey);
   }, [active, next, prev, finish]);
 
-  if (!active || !currentStep) return null;
+  if (!active) return null;
 
   // Compute card placement: prefer below, fall back to above, then to
   // centered. Falls back gracefully when rect is null (target not yet
@@ -424,7 +534,7 @@ export function GuidedTour() {
   let cardTop: number;
   let cardLeft: number;
 
-  if (rect) {
+  if (rect && !completed) {
     const spaceBelow = vh - (rect.top + rect.height) - CARD_GAP - 16;
     const spaceAbove = rect.top - CARD_GAP - 16;
 
@@ -442,6 +552,12 @@ export function GuidedTour() {
     cardLeft = vw / 2 - cardWidth / 2;
   }
 
+  // Compute section header text and pip groupings.
+  const sectionForCurrent = currentStep
+    ? sectionBreakdown.find((g) => g.steps.some((s) => s.id === currentStep.id))
+    : undefined;
+  const sectionIdx = sectionForCurrent ? sectionBreakdown.indexOf(sectionForCurrent) : -1;
+
   // Spotlight: absolutely-positioned div over the target rect with a
   // giant box-shadow that blacks out everything outside it.
   return createPortal(
@@ -457,86 +573,156 @@ export function GuidedTour() {
         className="absolute inset-0 pointer-events-auto"
         onClick={(e) => e.stopPropagation()}
       />
-      {/* Spotlight cutout */}
-      {rect && (
+      {/* Spotlight cutout. Hidden during transitions and on the
+       * celebration card; falls back to full-screen dim when no rect. */}
+      {rect && !completed && !transitioning ? (
         <div
-          className="absolute pointer-events-none transition-all duration-200"
+          className="tour-spotlight absolute pointer-events-none"
           style={{
             top: rect.top - SPOTLIGHT_PAD,
             left: rect.left - SPOTLIGHT_PAD,
             width: rect.width + SPOTLIGHT_PAD * 2,
             height: rect.height + SPOTLIGHT_PAD * 2,
-            borderRadius: 6,
-            boxShadow: "0 0 0 9999px rgba(4, 7, 12, 0.78)",
-            outline: "2px solid var(--color-primary)",
-            outlineOffset: 2,
           }}
         />
-      )}
-      {/* Fallback dim when no rect — the whole screen darkens so the
-       * card has contrast even if the target failed to mount. */}
-      {!rect && (
+      ) : (
         <div
-          className="absolute inset-0 pointer-events-none"
-          style={{ background: "rgba(4, 7, 12, 0.78)" }}
+          className="absolute inset-0 pointer-events-none transition-opacity duration-200"
+          style={{ background: "rgba(4, 7, 12, 0.78)", opacity: 1 }}
         />
       )}
       {/* Tooltip card */}
       <div
-        ref={cardRef}
-        className="absolute pointer-events-auto rounded-md border border-[var(--color-primary)] bg-[var(--color-surface)] p-5 shadow-2xl transition-all duration-200"
+        className="absolute pointer-events-auto rounded-md border border-[var(--color-primary)] bg-[var(--color-surface)] shadow-2xl"
         style={{
           top: cardTop,
           left: cardLeft,
           width: cardWidth,
+          opacity: transitioning ? 0 : 1,
+          transform: transitioning ? "translateY(4px)" : "translateY(0)",
+          transition: `opacity ${FADE_MS}ms ease, transform ${FADE_MS}ms ease, top 200ms ease, left 200ms ease`,
         }}
       >
-        <div className="flex items-center justify-between">
-          <div className="font-mono text-xs uppercase text-[var(--color-primary)] tracking-widest">
-            Tour · Step {stepIdx + 1} of {visibleSteps.length}
+        {/* Card header — section + step counter + skip */}
+        <div className="flex items-center justify-between border-b border-[var(--color-border)] px-5 pt-4 pb-3">
+          <div className="min-w-0 flex-1">
+            {completed ? (
+              <div className="font-mono text-[10px] uppercase text-[var(--color-primary)] tracking-widest">
+                Tour complete
+              </div>
+            ) : sectionForCurrent ? (
+              <div className="font-mono text-[10px] uppercase tracking-widest">
+                <span className="text-[var(--color-primary)]">{sectionForCurrent.label}</span>
+                <span className="text-[var(--color-text-muted)]"> · Section {sectionIdx + 1} of {totalSections}</span>
+              </div>
+            ) : null}
+            {!completed && currentStep ? (
+              <div className="mt-0.5 font-mono text-[10px] uppercase text-[var(--color-text-muted)] tracking-widest">
+                Step {stepIdx + 1} of {visibleSteps.length}
+              </div>
+            ) : null}
           </div>
           <button
             onClick={finish}
-            className="font-mono text-xs uppercase text-[var(--color-text-muted)] hover:text-[var(--color-text)] tracking-widest"
+            className="font-mono text-[10px] uppercase text-[var(--color-text-muted)] hover:text-[var(--color-text)] tracking-widest"
             aria-label="Skip tour"
           >
-            Skip
+            {completed ? "Close" : "Skip"}
           </button>
         </div>
-        <h3 id="tour-card-title" className="mt-2 font-sans text-lg font-semibold text-[var(--color-text)] tracking-tight">
-          {currentStep.title}
-        </h3>
-        <p className="mt-2 text-sm leading-relaxed text-[var(--color-text-secondary)]">
-          {currentStep.body}
-        </p>
-        {/* Step pips */}
-        <div className="mt-4 flex flex-wrap items-center gap-1">
-          {visibleSteps.map((_, i) => (
-            <span
-              key={i}
-              className="h-1 w-3 rounded-full transition-colors"
-              style={{ background: i <= stepIdx ? "var(--color-primary)" : "var(--color-border)" }}
-              aria-hidden
-            />
-          ))}
+
+        {/* Card body — title + body, or the closing celebration */}
+        <div className="px-5 pt-4 pb-2">
+          {completed ? (
+            <>
+              <h3 id="tour-card-title" className="font-sans text-lg font-semibold text-[var(--color-text)] tracking-tight">
+                You're all set
+              </h3>
+              <p className="mt-2 text-sm leading-relaxed text-[var(--color-text-secondary)]">
+                That's the whole tour. You can replay it any time from the help panel — press <kbd className="rounded-sm border border-[var(--color-border-active)] bg-[var(--color-bg)] px-1 py-0.5 font-mono text-[10px]">?</kbd> or click the <span className="font-mono text-xs text-[var(--color-primary)]">?</span> button bottom-right.
+              </p>
+              <p className="mt-3 text-sm leading-relaxed text-[var(--color-text-secondary)]">
+                If anything feels off as you work, press <kbd className="rounded-sm border border-[var(--color-border-active)] bg-[var(--color-bg)] px-1 py-0.5 font-mono text-[10px]">G</kbd> then <kbd className="rounded-sm border border-[var(--color-border-active)] bg-[var(--color-bg)] px-1 py-0.5 font-mono text-[10px]">F</kbd> to send feedback. We read every one.
+              </p>
+            </>
+          ) : currentStep ? (
+            <>
+              <h3 id="tour-card-title" className="font-sans text-lg font-semibold text-[var(--color-text)] tracking-tight">
+                {currentStep.title}
+              </h3>
+              <p className="mt-2 text-sm leading-relaxed text-[var(--color-text-secondary)]">
+                {currentStep.body}
+              </p>
+              {/* "Loading next page…" hint shows only when the target
+               * hasn't appeared yet on a route-bearing step. Lets the
+               * operator know nothing is broken — the page is just
+               * loading. */}
+              {waitingForTarget && currentStep.route ? (
+                <div className="mt-3 flex items-center gap-2 font-mono text-[10px] uppercase text-[var(--color-text-muted)] tracking-widest">
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--color-primary)]" />
+                  Loading {currentStep.route}…
+                </div>
+              ) : null}
+            </>
+          ) : null}
         </div>
-        <div className="mt-4 flex items-center justify-between">
+
+        {/* Grouped pips — small dots clustered by section with a gap
+         * between groups. Past sections are filled in muted, current
+         * step is the bright primary, future sections are outlined. */}
+        {!completed ? (
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-5 pb-1 pt-1">
+            {sectionBreakdown.map((group, gIdx) => (
+              <div key={group.key} className="flex items-center gap-1" aria-hidden>
+                {group.steps.map((s) => {
+                  const idxOf = visibleSteps.findIndex((vs) => vs.id === s.id);
+                  const isPast = idxOf < stepIdx;
+                  const isCurrent = idxOf === stepIdx;
+                  return (
+                    <span
+                      key={s.id}
+                      className="h-1.5 rounded-full transition-all duration-200"
+                      style={{
+                        width: isCurrent ? 14 : 6,
+                        background: isCurrent
+                          ? "var(--color-primary)"
+                          : isPast
+                            ? "var(--color-border-active)"
+                            : "var(--color-border)",
+                      }}
+                    />
+                  );
+                })}
+                {gIdx < sectionBreakdown.length - 1 ? (
+                  <span className="mx-0.5 h-px w-1 bg-[var(--color-border)]" aria-hidden />
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {/* Footer — back / next buttons + keyboard hint */}
+        <div className="flex items-center justify-between border-t border-[var(--color-border)] px-5 pt-3 pb-4">
           <button
             onClick={prev}
-            disabled={stepIdx === 0}
+            disabled={!completed && stepIdx === 0}
             className="rounded-sm border border-[var(--color-border-active)] px-3 py-1.5 font-mono text-xs uppercase tracking-widest text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] disabled:opacity-30"
           >
             Back
           </button>
+          <div className="font-mono text-[10px] uppercase text-[var(--color-text-muted)] tracking-widest">
+            ← / → · Esc
+          </div>
           <button
-            onClick={next}
+            onClick={completed ? finish : next}
             className="rounded-sm border border-[var(--color-primary)] bg-[var(--color-primary)] px-4 py-1.5 font-mono text-xs font-semibold uppercase text-white tracking-widest hover:bg-[var(--color-primary-hover)]"
           >
-            {stepIdx === visibleSteps.length - 1 ? "Got it" : "Next"}
+            {completed
+              ? "Finish"
+              : stepIdx === visibleSteps.length - 1
+                ? "Wrap up"
+                : "Next"}
           </button>
-        </div>
-        <div className="mt-3 font-mono text-[10px] uppercase text-[var(--color-text-muted)] tracking-widest">
-          ← / → to navigate · Esc to close
         </div>
       </div>
     </div>,

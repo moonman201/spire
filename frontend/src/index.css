@@ -594,3 +594,29 @@ textarea:focus-visible,
   text-transform: uppercase;
   box-shadow: 0 0 0 2px var(--color-bg), 0 4px 16px rgba(0, 0, 0, 0.6);
 }
+
+/* GuidedTour spotlight — subtle breathing pulse so the eye lands on
+ * the highlighted element without being shouted at. The 9999px box-
+ * shadow is the dim mask everywhere outside the rect; the outline +
+ * its alternation animates between two intensities. */
+.tour-spotlight {
+  border-radius: 6px;
+  box-shadow: 0 0 0 9999px rgba(4, 7, 12, 0.78);
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  animation: tour-spotlight-pulse 1.8s ease-in-out infinite;
+  transition: top 200ms ease, left 200ms ease, width 200ms ease, height 200ms ease;
+}
+@keyframes tour-spotlight-pulse {
+  0%, 100% {
+    outline-color: var(--color-primary);
+    outline-offset: 2px;
+  }
+  50% {
+    outline-color: rgba(96, 165, 250, 0.55);
+    outline-offset: 5px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tour-spotlight { animation: none; }
+}
