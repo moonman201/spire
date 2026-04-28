@@ -293,6 +293,11 @@ export function GuidedTour() {
   const navigate = useNavigate();
   const location = useLocation();
   const [active, setActive] = useState(false);
+  // Separate "visible" state drives the entrance/exit fade. We mount
+  // immediately on activation but start at opacity 0, then bump to 1
+  // on the next frame. On finish we drop to 0 and unmount once the
+  // transition has played out.
+  const [visible, setVisible] = useState(false);
   const [stepIdx, setStepIdx] = useState(0);
   // Separate "completed" state — when the user clicks past the last
   // step we show a celebration card before fully dismissing. Keeps the
@@ -453,11 +458,31 @@ export function GuidedTour() {
   }, [active, completed, currentStep, stepIdx, location.pathname]);
 
   const finish = useCallback(() => {
-    setActive(false);
-    setStepIdx(0);
-    setCompleted(false);
+    // Fade out, then unmount. Persists immediately so a refresh
+    // mid-fade still records "seen". 250ms matches FADE_MS-ish cadence
+    // and the CSS transition below.
     try { localStorage.setItem(SEEN_KEY, "1"); } catch { /* tolerant */ }
+    setVisible(false);
+    window.setTimeout(() => {
+      setActive(false);
+      setStepIdx(0);
+      setCompleted(false);
+    }, 260);
   }, []);
+
+  // Drive the entrance fade: when `active` flips on, mount with
+  // opacity 0, then on the next frame set visible=true so the CSS
+  // transition runs.
+  useEffect(() => {
+    if (!active) {
+      setVisible(false);
+      return;
+    }
+    // requestAnimationFrame ensures the initial render with
+    // visible=false has actually committed before we transition to 1.
+    const handle = window.requestAnimationFrame(() => setVisible(true));
+    return () => window.cancelAnimationFrame(handle);
+  }, [active]);
 
   const advance = useCallback(
     (delta: 1 | -1) => {
@@ -566,6 +591,10 @@ export function GuidedTour() {
       aria-modal="true"
       aria-labelledby="tour-card-title"
       className="fixed inset-0 z-[9500] pointer-events-none"
+      style={{
+        opacity: visible ? 1 : 0,
+        transition: "opacity 250ms ease",
+      }}
     >
       {/* Click-catcher absorbs clicks so the underlying app isn't
        * accidentally interacted with mid-tour. */}
